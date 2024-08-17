@@ -3,6 +3,7 @@
 #################
 .vscode
 /temp
+/config.json
 ## AVR Development
 *.eep
 *.elf

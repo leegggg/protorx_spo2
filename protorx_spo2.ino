@@ -3,14 +3,13 @@
 #include <PicoMQTT.h>
 #include <Preferences.h>
 #include <Wire.h>
-#include <dsps_biquad_gen.h>
-#include <esp_dsp.h>
 
 #include <CircularBuffer.hpp>
 
 #include "MAX30105.h"
 #include "spo2_algorithm.h"
 
+#include "ESP32TimerInterrupt.h"
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
@@ -22,15 +21,14 @@ Preferences prefs;
 PicoMQTT::Server mqtt;
 
 #define APP_NAME "protorx-spo2"
-#define BUFFER_LENGTH 1024
+#define BUFFER_LENGTH 100
 #define PIN_READ_LED 10
 
-#define PIN_SENSOR 8
+#define PIN_SENSOR 9
 #define PIN_MOTOR_PWM_1 5
 #define PIN_MOTOR_PWM_2 6
-#define PIN_MOTOR_PWM PIN_MOTOR_PWM_1
 
-#define PIN_SDA 9
+#define PIN_SDA 8
 #define PIN_SCL 2
 
 #define PIN_BTN_UP 21
@@ -38,15 +36,27 @@ PicoMQTT::Server mqtt;
 #define PIN_BTN_SHARP 3
 #define PIN_BTN_STAR 4
 
-#define INTERVAL_BASIC_MSG_MILLIS 5000
+#define INTERVAL_BASIC_MSG_MILLIS 30000
 #define INTERVAL_WATCHDOG_MILLIS 10000
 #define THREADHOLD_RED 100000
+#define INTERVAL_SCREEN_UPDATE 50
+
+#define INTERVAL_BTN_SCAN_MS 150
 
 #define MX3010X_MAX_RETRY 10
 #define IS_LED_BLINK false
 
 #define SCREEN_ADDRESS 0x3C
-#define OLED_RESET     -1
+#define OLED_RESET -1
+
+#define MOTOR_MAX_VOLTAGE 12
+#define MOTOR_MIN_VOLTAGE 4
+
+enum Screen { SCREEN_CONF, SCREEN_INFO, SCREEN_LOG, SCREEN_MAX };
+
+enum Config { CONFIG_MOTOR, CONFIG_INTERVAL, CONFIG_DIR, CONFIG_VOLTAGE };
+
+enum DirOption { DIR_UP, DIR_DOWN, DIR_AUTO, DIR_RANDOM };
 
 String MQTT_TOPIC;
 uint32_t irArray[BUFFER_LENGTH];  // infrared LED sensor data
@@ -59,52 +69,382 @@ int8_t validSPO2;      // indicator to show if the SPO2 calculation is valid
 int32_t heartRate;     // heart rate value
 int8_t validHeartRate; // indicator to show if the heart rate calculation is valid
 
-// iir param
-float coeffs_lpf[5];
-float lowpassFreq = 0.1;
-float qFactor = 3;
-float w_lpf[5] = {0, 0};
-float *irFloatArray;
-float *redFloatArray;
-float *irFloatArrayOut;
-float *redFloatArrayOut;
-
 bool mx30102_available = false;
+uint32_t sample_count = 0;
+uint32_t sample_freq_hz = 16;
+#define TARGET_FREQ 16
+CircularBuffer<long, BUFFER_LENGTH> sampleTsBuffer;
 
 long ts_last_basic_msg;
 
 long ts_last_watchdog_ok;
+long ts_last_screen_update;
 
 long ts_sensor_last;
 long ts_sensor_this;
+long ts_last_stop = 0;
 long last_interval;
 bool sensor_switch_update = false;
+long sensor_switch_count = 0;
 
-long target_interval = 400;
-long current_pwm = 128;
+long power_voltage = 20;
+
+long motor_interval = 400;
+long motor_percent = 50;
+long motor_pwm_1 = 0;
+long motor_pwm_2 = 0;
+bool current_dir = 0;
+uint8_t motor_diroption = 0;
+
+uint8_t current_config = 0;
+uint8_t current_screen = 0;
+bool config_update = false;
 
 CircularBuffer<long, 4> interval_buffer;
+CircularBuffer<String, 4> log_buffer;
 
 Adafruit_SSD1306 display;
+ESP32Timer IBtnScanTimer(1);
+
+void log(String msg) {
+    log_buffer.push(String(millis()) + ": \n" + msg);
+    Serial.println(msg);
+    JsonDocument doc;
+    doc["ts"] = millis();
+    doc["log"] = msg;
+    String res;
+    serializeJson(doc, res);
+    mqtt.publish(MQTT_TOPIC, res);
+}
+
+bool readSensor() {
+    particleSensor.check();
+    if (particleSensor.available() == false) {
+        return false;
+    }
+    uint32_t ir = particleSensor.getIR();
+    uint32_t red = particleSensor.getRed();
+    if (red < THREADHOLD_RED) {
+        return false;
+    }
+
+    irBuffer.push(ir);
+    redBuffer.push(red);
+    sample_count++;
+    sampleTsBuffer.push(millis());
+    sample_freq_hz = 1000 * BUFFER_LENGTH / (sampleTsBuffer.last() - sampleTsBuffer.first());
+    particleSensor.nextSample();
+
+    digitalWrite(PIN_READ_LED, !(!digitalRead(PIN_READ_LED) && IS_LED_BLINK));
+
+    return true;
+}
+
+void setMotor(long power_percent, uint8_t dir) {
+    current_dir = dir;
+    long motor_voltage = (MOTOR_MAX_VOLTAGE - MOTOR_MIN_VOLTAGE) * power_percent * 10 + MOTOR_MIN_VOLTAGE * 1000;
+    long pwm = 0;
+    if (power_percent > 0) {
+        pwm = 255 * motor_voltage / (power_voltage * 1000);
+        if (dir) {
+            motor_pwm_1 = pwm;
+            motor_pwm_2 = 0;
+        } else {
+            motor_pwm_1 = 0;
+            motor_pwm_2 = pwm;
+        }
+    } else {
+        motor_pwm_1 = 0;
+        motor_pwm_2 = 0;
+    }
+    log("Set motor: 1p:" + String(motor_pwm_1) + " 2p:" + String(motor_pwm_2) + " " + String(power_percent) + "% " + String(dir) +
+        "d " + String(pwm) + "w " + String(motor_voltage / 1000.0) + "mV");
+}
+
+void calcMotor() {
+    if (motor_diroption == DIR_AUTO) {
+        setMotor(motor_percent, !current_dir);
+    } else if (motor_diroption == DIR_RANDOM) {
+        setMotor(motor_percent, random(2));
+    } else {
+        setMotor(motor_percent, motor_diroption % 2);
+    }
+}
+
+void writeMotor() {
+    analogWrite(PIN_MOTOR_PWM_1, motor_pwm_1);
+    analogWrite(PIN_MOTOR_PWM_2, motor_pwm_2);
+}
 
 void IRAM_ATTR SensorSwitchInterrupt() {
     // deal with bounce
-    if (millis() - ts_sensor_this < 150) {
+    if (millis() - ts_sensor_this < 500) {
         return;
     }
     ts_sensor_last = ts_sensor_this;
     ts_sensor_this = millis();
     sensor_switch_update = true;
+    sensor_switch_count++;
 }
 
-void displayNetworkInfo() {
+bool IRAM_ATTR BtnScanTimerHandler(void *timerNo) {
+    if (digitalRead(PIN_BTN_STAR) == LOW) {
+        current_screen = (current_screen + 1) % 4;
+    }
+    if (digitalRead(PIN_BTN_SHARP) == LOW) {
+        current_config = (current_config + 1) % 4;
+    }
+    if (current_screen == SCREEN_CONF) {
+        if (digitalRead(PIN_BTN_UP) == LOW && digitalRead(PIN_BTN_STAR) == LOW) {
+            // restart
+            ESP.restart();
+        }
+        if (digitalRead(PIN_BTN_UP) == LOW) {
+            config_update = true;
+            switch (current_config) {
+            case CONFIG_MOTOR:
+                motor_percent += 5;
+                if (motor_percent > 100) {
+                    motor_percent = 100;
+                }
+                break;
+            case CONFIG_INTERVAL:
+                motor_interval = motor_interval * 101 / 100 + 1;
+                if (motor_interval > 3000) {
+                    motor_interval = 3000;
+                }
+                break;
+            case CONFIG_DIR:
+                motor_diroption = (motor_diroption + 1) % 4;
+                break;
+            case CONFIG_VOLTAGE:
+                power_voltage += 1;
+                break;
+            }
+        }
+        if (digitalRead(PIN_BTN_DOWN) == LOW) {
+            config_update = true;
+            switch (current_config) {
+            case CONFIG_MOTOR:
+                motor_percent -= 5;
+                if (motor_percent <= 0) {
+                    motor_percent = 1;
+                }
+                break;
+            case CONFIG_INTERVAL:
+                motor_interval = motor_interval * 99 / 100 - 1;
+                if (motor_interval < 0) {
+                    motor_interval = 0;
+                }
+                break;
+            case CONFIG_DIR:
+                motor_diroption = (motor_diroption + 3) % 4;
+                break;
+            case CONFIG_VOLTAGE:
+                // power_voltage -= 1;
+                if (power_voltage < 12) {
+                    power_voltage = 12;
+                }
+                break;
+            }
+        }
+    }
+
+    return true;
+}
+
+void displayConfig() {
     display.clearDisplay();
     display.setCursor(0, 0);
-    display.println("RSSI: " + String(WiFi.RSSI()) + "  TS: " + millis() / 1000);
-    display.println("IP: " + WiFi.localIP().toString());
+    float voltage = (motor_pwm_1 + motor_pwm_2) * power_voltage / 255.0;
+    display.println(String(millis() / 1000) + "  " + String(motor_pwm_1) + "  " + String(motor_pwm_2) + "  " + String(voltage));
+    if (mx30102_available) {
+        if (validHeartRate) {
+            display.print("$");
+        } else {
+            display.print(" ");
+        }
+        display.print("HR: " + String(heartRate) + "|");
+        if (validSPO2) {
+            display.print("$");
+        } else {
+            display.print(" ");
+        }
+        display.print("SPO2: " + String(spo2));
+        display.println("");
+    }
+    if (current_config == CONFIG_MOTOR) {
+        display.print("*");
+    }
+    display.println("Motor: " + String(motor_percent) + "%");
+    if (current_config == CONFIG_INTERVAL) {
+        display.print("*");
+    }
+    display.println("Interval: " + String(motor_interval));
+    if (current_config == CONFIG_DIR) {
+        display.print("*");
+    }
+    display.print("Dir: ");
+    switch (motor_diroption) {
+    case DIR_UP:
+        display.println("FWD");
+        break;
+    case DIR_DOWN:
+        display.println("REV");
+        break;
+    case DIR_AUTO:
+        display.println("AUTO");
+        break;
+    case DIR_RANDOM:
+        display.println("RANDOM");
+        break;
+    }
+    if (current_config == CONFIG_VOLTAGE) {
+        display.print("*");
+    }
+    display.println("Power voltage: " + String(power_voltage));
+    display.display();
+}
+
+void displayMx30102Chart() {
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    // draw ir and red chart with buffer
+    // find max and min in buffers to make chart
+    uint32_t max_red = 0;
+    uint32_t min_red = u_int32_t(-1);
+    uint32_t max_ir = 0;
+    uint32_t min_ir = u_int32_t(-1);
+    for (int i = 0; i < BUFFER_LENGTH; i++) {
+        if (redBuffer[i] > max_red) {
+            max_red = redBuffer[i];
+        }
+        if (redBuffer[i] < min_red) {
+            min_red = redBuffer[i];
+        }
+        if (irBuffer[i] > max_ir) {
+            max_ir = irBuffer[i];
+        }
+        if (irBuffer[i] < min_ir) {
+            min_ir = irBuffer[i];
+        }
+    }
+
+    uint32_t max_pt = max(max_red, max_ir);
+    uint32_t min_pt = min(min_red, min_ir);
+
+    if (validHeartRate) {
+        display.print("$");
+    } else {
+        display.print(" ");
+    }
+    display.print("HR: " + String(heartRate) + "|");
+    if (validSPO2) {
+        display.print("$");
+    } else {
+        display.print(" ");
+    }
+    display.print("SPO2: " + String(spo2));
+    display.println("");
+    switch (current_config) {
+    case CONFIG_MOTOR:
+        display.print("R");
+        break;
+    case CONFIG_INTERVAL:
+        display.print("I");
+        break;
+    case CONFIG_DIR:
+        display.print("B");
+        break;
+    case CONFIG_VOLTAGE:
+        display.print("D");
+        break;
+    default:
+        display.print("B");
+        break;
+    }
+    display.println(": " + String(min_pt) + " - " + String(max_pt));
+    display.println("F: " + String(sample_freq_hz) + "Hz");
+    // display.println(String(irBuffer[3]) + "," + String(map(irBuffer[3], min_pt, max_pt, 0, SCREEN_HEIGHT)));
+    // display.println(String(redBuffer[3]) + "," + String(map(redBuffer[3], min_pt, max_pt, 0, SCREEN_HEIGHT)));
+    for (int i = 0; i < SCREEN_WIDTH; i++) {
+        if (i >= BUFFER_LENGTH) {
+            break;
+        }
+        // display.drawPixel(i, SCREEN_HEIGHT - red, SSD1306_BLACK);
+
+        switch (current_config) {
+            uint32_t red;
+            uint32_t ir;
+        case CONFIG_MOTOR:
+            red = map(redBuffer[i], min_red, max_red, 0, SCREEN_HEIGHT);
+            display.drawPixel(i, SCREEN_HEIGHT - red, SSD1306_WHITE);
+            break;
+        case CONFIG_INTERVAL:
+            ir = map(irBuffer[i], min_ir, max_ir, 0, SCREEN_HEIGHT);
+            display.drawPixel(i, SCREEN_HEIGHT - ir, SSD1306_WHITE);
+            break;
+        case CONFIG_DIR:
+            red = map(redBuffer[i], min_red, max_red, 0, SCREEN_HEIGHT);
+            ir = map(irBuffer[i], min_ir, max_ir, 0, SCREEN_HEIGHT);
+            display.drawPixel(i, SCREEN_HEIGHT - red, SSD1306_WHITE);
+            display.drawPixel(i, SCREEN_HEIGHT - ir, SSD1306_WHITE);
+            break;
+        default:
+            red = map(redBuffer[i], min_pt, max_pt, 0, SCREEN_HEIGHT);
+            ir = map(irBuffer[i], min_pt, max_pt, 0, SCREEN_HEIGHT);
+            display.drawPixel(i, SCREEN_HEIGHT - red, SSD1306_WHITE);
+            display.drawPixel(i, SCREEN_HEIGHT - ir, SSD1306_WHITE);
+            break;
+        }
+    }
+    display.display();
+}
+
+void displayStatus() {
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.print("TS: " + String(millis() / 1000) + "  ");
+    if (WiFi.getMode() == WIFI_AP) {
+        display.println("");
+        display.println("AP: " + WiFi.softAPSSID());
+        display.println("IP: " + WiFi.softAPIP().toString());
+    } else {
+        display.println("RSSI: " + String(WiFi.RSSI()));
+        display.println("IP: " + WiFi.localIP().toString());
+    }
+
     display.println("MQTT: ");
     display.println(MQTT_TOPIC);
+    if (mx30102_available) {
+        display.println("MX: " + String(irBuffer.last()) + "," + String(redBuffer.last()));
+        display.println(String(sample_freq_hz) + "Hz");
+    }
     display.display();
+}
+
+void displayLog() {
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println(log_buffer.last());
+    display.display();
+}
+
+void updateDisplay() {
+    switch (current_screen) {
+    case SCREEN_CONF:
+        displayConfig();
+        break;
+    case SCREEN_INFO:
+        displayStatus();
+        break;
+    case SCREEN_LOG:
+        displayLog();
+        break;
+    case SCREEN_MAX:
+        displayMx30102Chart();
+        break;
+    }
 }
 
 void setup() {
@@ -121,17 +461,21 @@ void setup() {
     delay(2500);
     Serial.println("Starting protorx-spo2...");
 
+    // Setup BTN
+    pinMode(PIN_BTN_UP, INPUT_PULLUP);
+    pinMode(PIN_BTN_DOWN, INPUT_PULLUP);
+    pinMode(PIN_BTN_SHARP, INPUT_PULLUP);
+    pinMode(PIN_BTN_STAR, INPUT_PULLUP);
+    IBtnScanTimer.attachInterruptInterval(INTERVAL_BTN_SCAN_MS * 1000, BtnScanTimerHandler);
+
     // load config
     prefs.begin(APP_NAME);
     // TODO: set wifi config in ap mode
-    prefs.putString("ssid", "DoNotUseIt-ESP");
-    // prefs.putString("ssid", "CMCC_h3k2");
-    prefs.putString("wlan_password", "showmethemoney");
-    String ssid = prefs.getString("ssid", "");
-    String password = prefs.getString("wlan_password", "");
-    // ssid = "SSID";
-    // password = "88888888";
-
+    JsonDocument config;
+    deserializeJson(config, prefs.getString("config", "{}"));
+    motor_percent = prefs.getInt("motor_percent", 50);
+    motor_diroption = prefs.getChar("motor_dir_option", 0);
+    motor_interval = prefs.getInt("motor_interval", 500);
 
     // Initialize I2C
     Wire.setPins(PIN_SDA, PIN_SCL);
@@ -140,74 +484,113 @@ void setup() {
     display = Adafruit_SSD1306(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
     display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS);
     display.display();
-    delay(500); 
+    delay(500);
     display.clearDisplay();
 
     display.fillScreen(SSD1306_WHITE);
     display.display();
-    delay(500); 
+    delay(500);
     display.clearDisplay();
     display.display();
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+    ts_last_basic_msg = millis();
+    current_screen = SCREEN_CONF;
 
     // WiFi setup
     WiFi.mode(WIFI_STA);
     String macAddr = WiFi.macAddress();
-    Serial.println("\nUsing mac addr: " + macAddr);
+    log("\nUsing mac addr: " + macAddr);
     macAddr.replace(":", "");
     String hostname = String(APP_NAME) + "-" + macAddr.substring(macAddr.length() - 4, macAddr.length());
     WiFi.hostname(hostname);
-    WiFi.begin(ssid, password);
-    Serial.println("Connecting to WiFi " + ssid + " with hostname " + hostname);
-    display.setCursor(0, 0);
-    display.println("Connecting to WiFi");
-    display.println("SSID: " + ssid);
-    display.println("Hostname: " + hostname);
-    display.println("MAC: " + macAddr);
-    display.display();
-    for(int i = 0; i < 20; i++) {
-        delay(500);
-        Serial.print(".");
-        display.print(".");
-        display.display();
-        if(WiFi.status() == WL_CONNECTED) {
-            break;
+
+    // Try wifi configs from config in prefs
+    // config: {"wifi":[{"ssid":"ssid_str","password": "password_str"}]}
+    if (config.containsKey("wifi")) {
+        for (int i = 0; i < config["wifi"].size(); i++) {
+            String ssid = config["wifi"][i]["ssid"].as<String>();
+            String password = config["wifi"][i]["password"].as<String>();
+            WiFi.begin(ssid, password);
+            log("Connecting to WiFi " + ssid + " with hostname " + hostname);
+            display.clearDisplay();
+            display.setCursor(0, 0);
+            display.println("Connecting to WiFi");
+            display.println("AP: " + ssid);
+            display.println("Hostname: " + hostname);
+            display.println("MAC: " + macAddr);
+            display.display();
+            for (int i = 0; i < 10; i++) {
+                delay(500);
+                display.print(".");
+                display.display();
+                if (WiFi.status() == WL_CONNECTED) {
+                    break;
+                    log(String("\nUsing ip addr: ") + WiFi.localIP().toString());
+                }
+            }
+            if (WiFi.status() == WL_CONNECTED) {
+                break;
+            }
         }
     }
-    if(WiFi.status() != WL_CONNECTED) {
+
+    if (WiFi.status() != WL_CONNECTED) {
+        WiFi.disconnect();
         display.clearDisplay();
         display.setCursor(0, 0);
-        Serial.println("Failed to connect to WiFi");
-        display.println("Failed to connect to WiFi");
+        log("WiFi Sta Failed");
+        display.println("WiFi Sta Failed");
         display.display();
         delay(2000);
-        // reset soc
-        ESP.restart();
+        WiFi.mode(WIFI_MODE_AP);
+        WiFi.softAP(hostname, macAddr);
+        display.clearDisplay();
+        log("WiFi AP Mode: " + hostname + "," + macAddr + "," + WiFi.softAPIP().toString());
     }
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(2000);
-        Serial.print(".");
-        display.print(".");
-        display.display();
-    }
-    Serial.println(String("\nUsing ip addr: ") + WiFi.localIP().toString());
 
     // MQTT broker setup
     // Subscribe to a topic pattern and attach a callback
     MQTT_TOPIC = String("device/") + macAddr;
-    Serial.println("Subscribing to topic: " + MQTT_TOPIC);
+    log("Subscribing to topic: " + MQTT_TOPIC);
     mqtt.subscribe(MQTT_TOPIC.c_str(), [](const char *topic, const char *payload) {
-        Serial.printf("Received message in topic '%s': %s\n", topic, payload);
+        log(String("Received message in topic '") + String(topic) + ": " + String(payload));
         JsonDocument doc;
         deserializeJson(doc, payload);
-        if (doc.containsKey("motor") && doc["motor"].containsKey("target")) {
-            target_interval = doc["motor"]["target"];
-            prefs.putInt("target_interval", target_interval);
+        if (doc.containsKey("wifi")) {
+            // Save wifi config to prefs
+            JsonDocument wifi_config;
+            deserializeJson(wifi_config, prefs.getString("config", "{}"));
+            for (int i = 0; i < doc["wifi"].size(); i++) {
+                wifi_config["wifi"].add(doc["wifi"][i]);
+            }
+            String wifi_config_json;
+            serializeJson(wifi_config, wifi_config_json);
+            log("Saving wifi config: " + wifi_config_json);
         }
+        if (doc.containsKey("power")) {
+            if (doc["power"].containsKey("voltage")) {
+                power_voltage = doc["power"]["voltage"];
+            }
+        }
+        if (doc.containsKey("motor")) {
+            if (doc["motor"].containsKey("percent")) {
+                motor_percent = doc["motor"]["percent"];
+                prefs.putLong("motor_percent", motor_percent);
+            }
+            if (doc["motor"].containsKey("dir")) {
+                motor_diroption = doc["motor"]["diroption"].as<uint8_t>() % 4;
+                prefs.putChar("motor_diroption", motor_diroption);
+            }
+            if (doc["motor"].containsKey("interval")) {
+                motor_interval = doc["motor"]["interval"];
+                prefs.putLong("motor_interval", motor_interval);
+            }
+        }
+        config_update = true;
     });
     mqtt.begin();
-    displayNetworkInfo();
+    displayStatus();
 
     // Interrupt sensor switch
     pinMode(PIN_SENSOR, INPUT_PULLUP);
@@ -215,15 +598,18 @@ void setup() {
     ts_sensor_this = millis();
     sensor_switch_update = false;
     attachInterrupt(digitalPinToInterrupt(PIN_SENSOR), SensorSwitchInterrupt, RISING);
-    for (int i = 0; i < interval_buffer.capacity; i++) {
-        interval_buffer.push(300);
-    }
 
     // Initialize motor
-    current_pwm = 125;
-    target_interval = prefs.getInt("target_interval", 400);
-    pinMode(PIN_MOTOR_PWM, OUTPUT);
-    analogWrite(PIN_MOTOR_PWM, current_pwm);
+    pinMode(PIN_MOTOR_PWM_1, OUTPUT);
+    pinMode(PIN_MOTOR_PWM_2, OUTPUT);
+    digitalWrite(PIN_MOTOR_PWM_2, LOW);
+    analogWrite(PIN_MOTOR_PWM_1, 127);
+    delay(20);
+    digitalWrite(PIN_MOTOR_PWM_1, LOW);
+    analogWrite(PIN_MOTOR_PWM_2, 127);
+    delay(20);
+    digitalWrite(PIN_MOTOR_PWM_1, LOW);
+    digitalWrite(PIN_MOTOR_PWM_2, LOW);
 
     // Initialize spo2 sensor
     mx30102_available = particleSensor.begin();
@@ -232,7 +618,7 @@ void setup() {
             break;
         }
         mx30102_available = particleSensor.begin();
-        Serial.println("MAX30105 is not loaded, retrying.");
+        log("MAX30105 is not loaded, retrying.");
         delay(100);
     }
     if (mx30102_available) {
@@ -241,55 +627,30 @@ void setup() {
         byte ledMode = prefs.getChar("led_mode", 2);              // Options: 1 = Red only, 2 = Red + IR, 3 = Red + IR + Green
         // Real sample rate may be only about 20hz
         byte sampleRate = prefs.getChar("sample_rate", 200); // Options: 50, 100, 200, 400, 800, 1000, 1600, 3200
-        int pulseWidth = prefs.getInt("pulse_width", 411);   // Options: 69, 118, 215, 411
+        int pulseWidth = prefs.getInt("pulse_width", 215);   // Options: 69, 118, 215, 411
         int adcRange = prefs.getInt("adc_range", 4096);      // Options: 2048, 4096, 8192, 16384
         particleSensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange);
-        Serial.print("Red,IR=");
-        Serial.print(particleSensor.getRed());
-        Serial.print(",");
-        Serial.println(particleSensor.getIR());
-        Serial.println("MAX30105 is set");
-        esp_err_t res = dsps_biquad_gen_lpf_f32(coeffs_lpf, lowpassFreq, qFactor);
-        if (res != ESP_OK) {
-            Serial.println("iir init failed");
-        }
-        irFloatArray = (float *)malloc(BUFFER_LENGTH * sizeof(float));
-        redFloatArray = (float *)malloc(BUFFER_LENGTH * sizeof(float));
-        irFloatArrayOut = (float *)malloc(BUFFER_LENGTH * sizeof(float));
-        redFloatArrayOut = (float *)malloc(BUFFER_LENGTH * sizeof(float));
-
+        log("Red,IR=" + String(particleSensor.getRed()) + "," + particleSensor.getIR());
+        log("MAX30105 is set");
         digitalWrite(PIN_READ_LED, LOW);
     } else {
-        Serial.println("MAX30105 is not loaded, skipping.");
+        log("MAX30105 is not loaded, skipping.");
         mx30102_available = false;
     }
 }
 
-bool readSensor() {
-    particleSensor.check();
-    if (particleSensor.available() == false) {
-        return false;
-    }
-    uint32_t ir = particleSensor.getIR();
-    uint32_t red = particleSensor.getRed();
-    if (red < THREADHOLD_RED) {
-        return false;
-    }
-
-    irBuffer.push(ir);
-    redBuffer.push(red);
-    particleSensor.nextSample();
-
-    digitalWrite(PIN_READ_LED, !(!digitalRead(PIN_READ_LED) && IS_LED_BLINK));
-
-    return true;
-}
-
 void loop() {
     mqtt.loop();
+    if (millis() - ts_last_screen_update > INTERVAL_SCREEN_UPDATE) {
+        ts_last_screen_update = millis();
+        updateDisplay();
+    }
+
+    // Motor update
+    writeMotor();
 
     // Watchdog
-    if (millis() - ts_last_watchdog_ok > INTERVAL_WATCHDOG_MILLIS || millis() < ts_last_watchdog_ok) {
+    if (millis() - ts_last_watchdog_ok > INTERVAL_WATCHDOG_MILLIS) {
         // TODO: Watchdog task
         ts_last_watchdog_ok = millis();
         JsonDocument doc;
@@ -301,17 +662,36 @@ void loop() {
         mqtt.publish(MQTT_TOPIC, res);
     }
 
+    // Config update
+    if (config_update) {
+        config_update = false;
+        prefs.putLong("motor_interval", motor_interval);
+        prefs.putLong("motor_percent", motor_percent);
+        prefs.putChar("motor_diroption", motor_diroption);
+        log("Config updated");
+    }
+
     // Publish basic info every 5 seconds
     if (millis() - ts_last_basic_msg > INTERVAL_BASIC_MSG_MILLIS || millis() < ts_last_basic_msg) {
         ts_last_basic_msg = millis();
         JsonDocument doc;
         doc["ts"] = millis();
-        doc["wifi"]["ip"] = String(WiFi.localIP().toString());
-        doc["wifi"]["mac"] = WiFi.macAddress();
-        doc["wifi"]["hostname"] = WiFi.getHostname();
-        doc["wifi"]["status"] = WiFi.status();
-        doc["wifi"]["ssid"] = WiFi.SSID();
-        doc["wifi"]["rssi"] = WiFi.RSSI();
+        if (WiFi.getMode() == WIFI_AP) {
+            doc["wifi"]["mode"] = "AP";
+            doc["wifi"]["ip"] = String(WiFi.softAPIP().toString());
+            doc["wifi"]["mac"] = WiFi.softAPmacAddress();
+            doc["wifi"]["hostname"] = WiFi.getHostname();
+            doc["wifi"]["status"] = WiFi.status();
+            doc["wifi"]["ssid"] = WiFi.softAPSSID();
+        } else {
+            doc["wifi"]["mode"] = "STA";
+            doc["wifi"]["ip"] = String(WiFi.localIP().toString());
+            doc["wifi"]["mac"] = WiFi.macAddress();
+            doc["wifi"]["hostname"] = WiFi.getHostname();
+            doc["wifi"]["status"] = WiFi.status();
+            doc["wifi"]["ssid"] = WiFi.SSID();
+            doc["wifi"]["rssi"] = WiFi.RSSI();
+        }
 
         doc["mqtt"]["topic"] = MQTT_TOPIC;
 
@@ -327,74 +707,41 @@ void loop() {
         doc["sensor_switch"]["last"] = ts_sensor_last;
         doc["sensor_switch"]["this"] = ts_sensor_this;
 
-        doc["motor"]["current"] = current_pwm;
-        doc["motor"]["target"] = target_interval;
+        doc["motor"]["current"] = motor_pwm_1 + motor_pwm_2;
+        doc["motor"]["dir"] = motor_pwm_1 > motor_pwm_1;
+        doc["motor"]["dir_option"] = motor_diroption;
+        doc["motor"]["pwm_1"] = motor_pwm_1;
+        doc["motor"]["pwm_2"] = motor_pwm_2;
+        doc["motor"]["percent"] = motor_percent;
+        doc["motor"]["interval"] = motor_interval;
+
+        doc["power"]["voltage"] = power_voltage;
 
         String res;
         serializeJson(doc, res);
         mqtt.publish(MQTT_TOPIC, res);
-        displayNetworkInfo();
     }
 
-    // Sensor switch
-    if (sensor_switch_update) {
+    if (sensor_switch_update && sensor_switch_count % 2 == 0) {
         sensor_switch_update = false;
-        JsonDocument doc;
-
-        interval_buffer.push(ts_sensor_this - ts_sensor_last);
-        // calc average
-        long sum = 0;
-        for (int i = 0; i < interval_buffer.capacity; i++) {
-            sum += interval_buffer[i];
-        }
-        long avg = sum / interval_buffer.capacity;
-        doc["sensor_switch"]["avg"] = avg;
-
-        if (avg > target_interval) {
-            current_pwm = current_pwm + 5;
-            if (current_pwm > 200) {
-                current_pwm = 200;
-            }
-            analogWrite(PIN_MOTOR_PWM, current_pwm);
-        } else {
-            current_pwm = current_pwm - 1;
-            if (current_pwm < 100) {
-                current_pwm = 100;
-            }
-            analogWrite(PIN_MOTOR_PWM, current_pwm);
-        }
-
-        doc["ts"] = millis();
-        doc["sensor_switch"]["interval"] = ts_sensor_this - ts_sensor_last;
-        doc["sensor_switch"]["last"] = ts_sensor_last;
-        doc["sensor_switch"]["this"] = ts_sensor_this;
-
-        String res;
-        serializeJson(doc, res);
-        Serial.println(res);
-        mqtt.publish(MQTT_TOPIC, res);
+        log("stop motor");
+        setMotor(0, current_dir);
+        ts_last_stop = millis();
     }
-    return;
+
+    // restart motor
+    if (millis() - ts_last_stop > motor_interval && (motor_pwm_1 + motor_pwm_2) <= 0) {
+        calcMotor();
+    }
 
     // If we have enough data, run the algorithm
     if (mx30102_available && readSensor() && irBuffer.isFull()) {
         redBuffer.copyToArray(redArray);
         irBuffer.copyToArray(irArray);
 
-        for (int i = 0; i < BUFFER_LENGTH; i++) {
-            redFloatArray[i] = redArray[i] * 1.0;
-            irFloatArray[i] = irArray[i] * 1.0;
-        }
-        dsps_biquad_f32(redFloatArray, redFloatArrayOut, BUFFER_LENGTH, coeffs_lpf, w_lpf);
-        dsps_biquad_f32(irFloatArray, irFloatArrayOut, BUFFER_LENGTH, coeffs_lpf, w_lpf);
-        for (int i = 0; i < BUFFER_LENGTH; i++) {
-            redArray[i] = (uint16_t)redFloatArrayOut[i];
-            irArray[i] = (uint16_t)irFloatArrayOut[i];
-        }
-
-        // Serial.println(irBuffer.last());
-        // maxim_heart_rate_and_oxygen_saturation(irArray, BUFFER_LENGTH, redArray, &spo2, &validSPO2, &heartRate, &validHeartRate);
-        if (validSPO2 || random(1000) <= 1) {
+        maxim_heart_rate_and_oxygen_saturation(irArray, BUFFER_LENGTH, redArray, &spo2, &validSPO2, &heartRate, &validHeartRate);
+        heartRate = heartRate * sample_freq_hz / FreqS;
+        if ((validSPO2 && validHeartRate && sample_freq_hz == TARGET_FREQ) || random(1000) <= 1) {
             // make json object
             JsonDocument doc;
             doc["ts"] = millis();
@@ -405,22 +752,11 @@ void loop() {
             doc["mx30102"]["validSPO2"] = validSPO2;
             doc["mx30102"]["heartRate"] = heartRate;
             doc["mx30102"]["validHeartRate"] = validHeartRate;
+            doc["mx30102"]["freq"] = sample_freq_hz;
 
             String res;
             serializeJson(doc, res);
-            Serial.println(res);
             mqtt.publish(MQTT_TOPIC, res);
-            // Remove 25 oldest points
-            // for (int i = 0; i < 25; i++) {
-            //     irBuffer.shift();
-            //     redBuffer.shift();
-            // }
-            for (int i = 0; i < BUFFER_LENGTH; i++) {
-                Serial.print(irArray[i]);
-                Serial.print("\t");
-                Serial.print(irFloatArray[i]);
-                Serial.println("");
-            }
         }
     }
 }
