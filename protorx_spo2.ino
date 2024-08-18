@@ -12,11 +12,13 @@
 #include "ESP32TimerInterrupt.h"
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <Adafruit_SGP30.h>
 
 #define SCREEN_WIDTH 128 // OLED display width, in pixels
 #define SCREEN_HEIGHT 64 // OLED display height, in pixels
 
 MAX30105 particleSensor;
+Adafruit_SGP30 sgp;
 Preferences prefs;
 PicoMQTT::Server mqtt;
 
@@ -70,6 +72,7 @@ int32_t heartRate;     // heart rate value
 int8_t validHeartRate; // indicator to show if the heart rate calculation is valid
 
 bool mx30102_available = false;
+bool sgp30_available = false;
 uint32_t sample_count = 0;
 uint32_t sample_freq_hz = 16;
 #define TARGET_FREQ 16
@@ -637,6 +640,14 @@ void setup() {
         log("MAX30105 is not loaded, skipping.");
         mx30102_available = false;
     }
+
+    // Initialize SGP30 sensor
+    sgp30_available = sgp.begin();
+    if (sgp30_available) {
+        log("SGP30 is loaded");
+    } else {
+        log("SGP30 is not loaded, skipping.");
+    }
 }
 
 void loop() {
@@ -754,6 +765,27 @@ void loop() {
             doc["mx30102"]["validHeartRate"] = validHeartRate;
             doc["mx30102"]["freq"] = sample_freq_hz;
 
+            String res;
+            serializeJson(doc, res);
+            mqtt.publish(MQTT_TOPIC, res);
+        }
+    }
+
+    // SGP30
+    if (sgp30_available && false) {
+        if (millis() % 10000 == 0) {
+            if (!sgp.IAQmeasure()) {
+                log("SGP30 IAQ measure failed");
+            }
+            if (!sgp.IAQmeasureRaw()) {
+                log("SGP30 IAQ measure raw failed");
+            }
+            JsonDocument doc;
+            doc["ts"] = millis();
+            doc["sgp30"]["tvoc"] = sgp.TVOC;
+            doc["sgp30"]["eco2"] = sgp.eCO2;
+            doc["sgp30"]["rawH2"] = sgp.rawH2;
+            doc["sgp30"]["rawEthanol"] = sgp.rawEthanol;
             String res;
             serializeJson(doc, res);
             mqtt.publish(MQTT_TOPIC, res);
