@@ -11,8 +11,8 @@
 
 #include "ESP32TimerInterrupt.h"
 #include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
 #include <Adafruit_SGP30.h>
+#include <Adafruit_SSD1306.h>
 
 #define SCREEN_WIDTH 128 // OLED display width, in pixels
 #define SCREEN_HEIGHT 64 // OLED display height, in pixels
@@ -40,8 +40,11 @@ PicoMQTT::Server mqtt;
 
 #define INTERVAL_BASIC_MSG_MILLIS 30000
 #define INTERVAL_WATCHDOG_MILLIS 10000
+#define INTERVAL_SGP30_UPDATE_MILLIS 1000
+#define INTERVAL_SGP30_BASELINE_MILLIS 60000
 #define THREADHOLD_RED 100000
 #define INTERVAL_SCREEN_UPDATE 50
+#define INTERVAL_SCREEN_OFF 60000
 
 #define INTERVAL_BTN_SCAN_MS 150
 
@@ -54,7 +57,7 @@ PicoMQTT::Server mqtt;
 #define MOTOR_MAX_VOLTAGE 12
 #define MOTOR_MIN_VOLTAGE 4
 
-enum Screen { SCREEN_CONF, SCREEN_INFO, SCREEN_LOG, SCREEN_MAX };
+enum Screen { SCREEN_CONF, SCREEN_INFO, SCREEN_LOG, SCREEN_MAX, SCREEN_OFF };
 
 enum Config { CONFIG_MOTOR, CONFIG_INTERVAL, CONFIG_DIR, CONFIG_VOLTAGE };
 
@@ -82,6 +85,9 @@ long ts_last_basic_msg;
 
 long ts_last_watchdog_ok;
 long ts_last_screen_update;
+long ts_last_sgp30_update;
+long ts_last_sgp30_baseline;
+long ts_last_btn_press;
 
 long ts_sensor_last;
 long ts_sensor_this;
@@ -191,8 +197,16 @@ void IRAM_ATTR SensorSwitchInterrupt() {
 }
 
 bool IRAM_ATTR BtnScanTimerHandler(void *timerNo) {
+    // Turn off screen if no button pressed
+    if (
+        digitalRead(PIN_BTN_UP) == LOW || 
+        digitalRead(PIN_BTN_DOWN) == LOW || 
+        digitalRead(PIN_BTN_SHARP) == LOW ||
+        digitalRead(PIN_BTN_STAR) == LOW) {
+        ts_last_btn_press = millis();
+    }
     if (digitalRead(PIN_BTN_STAR) == LOW) {
-        current_screen = (current_screen + 1) % 4;
+        current_screen = (current_screen + 1) % 5;
     }
     if (digitalRead(PIN_BTN_SHARP) == LOW) {
         current_config = (current_config + 1) % 4;
@@ -275,6 +289,11 @@ void displayConfig() {
         }
         display.print("SPO2: " + String(spo2));
         display.println("");
+    }
+    if (sgp30_available) {
+        display.println("V: " + String(sgp.TVOC) + " C: " + String(sgp.eCO2));
+    } else {
+        display.println("SGP30 not available");
     }
     if (current_config == CONFIG_MOTOR) {
         display.print("*");
@@ -447,6 +466,10 @@ void updateDisplay() {
     case SCREEN_MAX:
         displayMx30102Chart();
         break;
+    case SCREEN_OFF:
+        display.clearDisplay();
+        display.display();
+        break;
     }
 }
 
@@ -469,6 +492,7 @@ void setup() {
     pinMode(PIN_BTN_DOWN, INPUT_PULLUP);
     pinMode(PIN_BTN_SHARP, INPUT_PULLUP);
     pinMode(PIN_BTN_STAR, INPUT_PULLUP);
+    ts_last_btn_press = millis();
     IBtnScanTimer.attachInterruptInterval(INTERVAL_BTN_SCAN_MS * 1000, BtnScanTimerHandler);
 
     // load config
@@ -644,6 +668,17 @@ void setup() {
     // Initialize SGP30 sensor
     sgp30_available = sgp.begin();
     if (sgp30_available) {
+        ts_last_sgp30_update = millis();
+        ts_last_sgp30_baseline = millis();
+        // set baseline if available
+        uint16_t eco2_base = prefs.getUShort("sgp30_eco2_base", 0);
+        uint16_t tvoc_base = prefs.getUShort("sgp30_tvoc_base", 0);
+        if (eco2_base > 0 && tvoc_base > 0) {
+            sgp.setIAQBaseline(eco2_base, tvoc_base);
+            log("Set SGP30 base line: " + String(eco2_base) + "," + String(tvoc_base));
+        } else {
+            log("SGP30 base line not found");
+        }
         log("SGP30 is loaded");
     } else {
         log("SGP30 is not loaded, skipping.");
@@ -653,6 +688,9 @@ void setup() {
 void loop() {
     mqtt.loop();
     if (millis() - ts_last_screen_update > INTERVAL_SCREEN_UPDATE) {
+        if(millis() - ts_last_btn_press > INTERVAL_SCREEN_OFF) {
+            current_screen = SCREEN_OFF;
+        }
         ts_last_screen_update = millis();
         updateDisplay();
     }
@@ -728,6 +766,12 @@ void loop() {
 
         doc["power"]["voltage"] = power_voltage;
 
+        doc["sgp30"]["ok"] = sgp30_available;
+        doc["sgp30"]["tvoc"] = sgp.TVOC;
+        doc["sgp30"]["eco2"] = sgp.eCO2;
+        doc["sgp30"]["rawH2"] = sgp.rawH2;
+        doc["sgp30"]["rawEthanol"] = sgp.rawEthanol;
+
         String res;
         serializeJson(doc, res);
         mqtt.publish(MQTT_TOPIC, res);
@@ -772,20 +816,32 @@ void loop() {
     }
 
     // SGP30
-    if (sgp30_available && false) {
-        if (millis() % 10000 == 0) {
-            if (!sgp.IAQmeasure()) {
-                log("SGP30 IAQ measure failed");
-            }
-            if (!sgp.IAQmeasureRaw()) {
-                log("SGP30 IAQ measure raw failed");
-            }
+    if (sgp30_available && millis() - ts_last_sgp30_update > INTERVAL_SGP30_UPDATE_MILLIS) {
+        ts_last_sgp30_update = millis();
+        if (!sgp.IAQmeasure()) {
+            log("SGP30 IAQ measure failed");
+        }
+        if (!sgp.IAQmeasureRaw()) {
+            log("SGP30 IAQ measure raw failed");
+        }
+        // get base line
+        if (millis() - ts_last_sgp30_baseline > INTERVAL_SGP30_BASELINE_MILLIS) {
+            ts_last_sgp30_baseline = millis();
             JsonDocument doc;
             doc["ts"] = millis();
             doc["sgp30"]["tvoc"] = sgp.TVOC;
             doc["sgp30"]["eco2"] = sgp.eCO2;
             doc["sgp30"]["rawH2"] = sgp.rawH2;
             doc["sgp30"]["rawEthanol"] = sgp.rawEthanol;
+            uint16_t eco2_base, tvoc_base;
+            if (sgp.getIAQBaseline(&eco2_base, &tvoc_base)) {
+                doc["sgp30"]["eco2_base"] = eco2_base;
+                doc["sgp30"]["tvoc_base"] = tvoc_base;
+            }
+            // Save base line
+            prefs.putUShort("sgp30_eco2_base", eco2_base);
+            prefs.putUShort("sgp30_tvoc_base", tvoc_base);
+            log("Saved SGP30 base line: " + String(eco2_base) + "," + String(tvoc_base));
             String res;
             serializeJson(doc, res);
             mqtt.publish(MQTT_TOPIC, res);
