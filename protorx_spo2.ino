@@ -6,21 +6,36 @@
 
 #include <CircularBuffer.hpp>
 
-#include "MAX30105.h"
-#include "spo2_algorithm.h"
-
 #include "ESP32TimerInterrupt.h"
+#include <Adafruit_AHTX0.h>
+#include <Adafruit_BMP280.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SGP30.h>
 #include <Adafruit_SSD1306.h>
+#include <MAX30105.h>
+#include <spo2_algorithm.h>
+
+#include "btn.hpp"
+#include "logger.hpp"
+#include "menu.hpp"
+#include "page_logger.hpp"
+#include "page_sys_status.hpp"
+#include "ssd_1306_display.hpp"
 
 #define SCREEN_WIDTH 128 // OLED display width, in pixels
 #define SCREEN_HEIGHT 64 // OLED display height, in pixels
 
 MAX30105 particleSensor;
 Adafruit_SGP30 sgp;
+Adafruit_AHTX0 aht;
+Adafruit_BMP280 bmp;
 Preferences prefs;
 PicoMQTT::Server mqtt;
+
+Logger logger;
+Btn btn;
+
+Menu menu;
 
 #define APP_NAME "protorx-spo2"
 #define BUFFER_LENGTH 100
@@ -32,11 +47,6 @@ PicoMQTT::Server mqtt;
 
 #define PIN_SDA 8
 #define PIN_SCL 2
-
-#define PIN_BTN_UP 21
-#define PIN_BTN_DOWN 20
-#define PIN_BTN_SHARP 3
-#define PIN_BTN_STAR 4
 
 #define INTERVAL_BASIC_MSG_MILLIS 30000
 #define INTERVAL_WATCHDOG_MILLIS 10000
@@ -57,11 +67,21 @@ PicoMQTT::Server mqtt;
 #define MOTOR_MAX_VOLTAGE 12
 #define MOTOR_MIN_VOLTAGE 4
 
-enum Screen { SCREEN_CONF, SCREEN_INFO, SCREEN_LOG, SCREEN_MAX, SCREEN_OFF };
+enum Screen { SCREEN_CONF,
+              SCREEN_INFO,
+              SCREEN_LOG,
+              SCREEN_MAX,
+              SCREEN_OFF };
 
-enum Config { CONFIG_MOTOR, CONFIG_INTERVAL, CONFIG_DIR, CONFIG_VOLTAGE };
+enum Config { CONFIG_MOTOR,
+              CONFIG_INTERVAL,
+              CONFIG_DIR,
+              CONFIG_VOLTAGE };
 
-enum DirOption { DIR_UP, DIR_DOWN, DIR_AUTO, DIR_RANDOM };
+enum DirOption { DIR_UP,
+                 DIR_DOWN,
+                 DIR_AUTO,
+                 DIR_RANDOM };
 
 String MQTT_TOPIC;
 uint32_t irArray[BUFFER_LENGTH];  // infrared LED sensor data
@@ -76,6 +96,8 @@ int8_t validHeartRate; // indicator to show if the heart rate calculation is val
 
 bool mx30102_available = false;
 bool sgp30_available = false;
+bool aht20_available = false;
+bool bmp280_available = false;
 uint32_t sample_count = 0;
 uint32_t sample_freq_hz = 16;
 #define TARGET_FREQ 16
@@ -110,20 +132,13 @@ uint8_t current_screen = 0;
 bool config_update = false;
 
 CircularBuffer<long, 4> interval_buffer;
-CircularBuffer<String, 4> log_buffer;
-
-Adafruit_SSD1306 display;
 ESP32Timer IBtnScanTimer(1);
 
-void log(String msg) {
-    log_buffer.push(String(millis()) + ": \n" + msg);
-    Serial.println(msg);
-    JsonDocument doc;
-    doc["ts"] = millis();
-    doc["log"] = msg;
-    String res;
-    serializeJson(doc, res);
-    mqtt.publish(MQTT_TOPIC, res);
+uint32_t getAbsoluteHumidity(float temperature, float humidity) {
+    // approximation formula from Sensirion SGP30 Driver Integration chapter 3.15
+    const float absoluteHumidity = 216.7f * ((humidity / 100.0f) * 6.112f * exp((17.62f * temperature) / (243.12f + temperature)) / (273.15f + temperature)); // [g/m^3]
+    const uint32_t absoluteHumidityScaled = static_cast<uint32_t>(1000.0f * absoluteHumidity);                                                                // [mg/m^3]
+    return absoluteHumidityScaled;
 }
 
 bool readSensor() {
@@ -166,8 +181,8 @@ void setMotor(long power_percent, uint8_t dir) {
         motor_pwm_1 = 0;
         motor_pwm_2 = 0;
     }
-    log("Set motor: 1p:" + String(motor_pwm_1) + " 2p:" + String(motor_pwm_2) + " " + String(power_percent) + "% " + String(dir) +
-        "d " + String(pwm) + "w " + String(motor_voltage / 1000.0) + "mV");
+    logger.log("Set motor: 1p:" + String(motor_pwm_1) + " 2p:" + String(motor_pwm_2) + " " + String(power_percent) + "% " +
+               String(dir) + "d " + String(pwm) + "w " + String(motor_voltage / 1000.0) + "mV");
 }
 
 void calcMotor() {
@@ -198,10 +213,7 @@ void IRAM_ATTR SensorSwitchInterrupt() {
 
 bool IRAM_ATTR BtnScanTimerHandler(void *timerNo) {
     // Turn off screen if no button pressed
-    if (
-        digitalRead(PIN_BTN_UP) == LOW || 
-        digitalRead(PIN_BTN_DOWN) == LOW || 
-        digitalRead(PIN_BTN_SHARP) == LOW ||
+    if (digitalRead(PIN_BTN_UP) == LOW || digitalRead(PIN_BTN_DOWN) == LOW || digitalRead(PIN_BTN_SHARP) == LOW ||
         digitalRead(PIN_BTN_STAR) == LOW) {
         ts_last_btn_press = millis();
     }
@@ -448,7 +460,7 @@ void displayStatus() {
 void displayLog() {
     display.clearDisplay();
     display.setCursor(0, 0);
-    display.println(log_buffer.last());
+    display.println(logger.tail());
     display.display();
 }
 
@@ -486,12 +498,15 @@ void setup() {
     Serial.begin(115200);
     delay(2500);
     Serial.println("Starting protorx-spo2...");
+    logger.setSerial(&Serial);
 
     // Setup BTN
-    pinMode(PIN_BTN_UP, INPUT_PULLUP);
-    pinMode(PIN_BTN_DOWN, INPUT_PULLUP);
-    pinMode(PIN_BTN_SHARP, INPUT_PULLUP);
-    pinMode(PIN_BTN_STAR, INPUT_PULLUP);
+    btn.begin();
+    attachInterrupt(digitalPinToInterrupt(PIN_BTN_UP), []() { btn.pressed(BTN_UP); }, FALLING);
+    attachInterrupt(digitalPinToInterrupt(PIN_BTN_DOWN), []() { btn.pressed(BTN_DOWN); }, FALLING);
+    attachInterrupt(digitalPinToInterrupt(PIN_BTN_SHARP), []() { btn.pressed(BTN_SHARP); }, FALLING);
+    attachInterrupt(digitalPinToInterrupt(PIN_BTN_STAR), []() { btn.pressed(BTN_STAR); }, FALLING);
+
     ts_last_btn_press = millis();
     IBtnScanTimer.attachInterruptInterval(INTERVAL_BTN_SCAN_MS * 1000, BtnScanTimerHandler);
 
@@ -521,13 +536,13 @@ void setup() {
     display.display();
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+
     ts_last_basic_msg = millis();
-    current_screen = SCREEN_CONF;
 
     // WiFi setup
     WiFi.mode(WIFI_STA);
     String macAddr = WiFi.macAddress();
-    log("\nUsing mac addr: " + macAddr);
+    logger.log("\nUsing mac addr: " + macAddr);
     macAddr.replace(":", "");
     String hostname = String(APP_NAME) + "-" + macAddr.substring(macAddr.length() - 4, macAddr.length());
     WiFi.hostname(hostname);
@@ -539,7 +554,7 @@ void setup() {
             String ssid = config["wifi"][i]["ssid"].as<String>();
             String password = config["wifi"][i]["password"].as<String>();
             WiFi.begin(ssid, password);
-            log("Connecting to WiFi " + ssid + " with hostname " + hostname);
+            logger.log("Connecting to WiFi " + ssid + " with hostname " + hostname);
             display.clearDisplay();
             display.setCursor(0, 0);
             display.println("Connecting to WiFi");
@@ -553,7 +568,7 @@ void setup() {
                 display.display();
                 if (WiFi.status() == WL_CONNECTED) {
                     break;
-                    log(String("\nUsing ip addr: ") + WiFi.localIP().toString());
+                    logger.log(String("\nUsing ip addr: ") + WiFi.localIP().toString());
                 }
             }
             if (WiFi.status() == WL_CONNECTED) {
@@ -566,22 +581,22 @@ void setup() {
         WiFi.disconnect();
         display.clearDisplay();
         display.setCursor(0, 0);
-        log("WiFi Sta Failed");
+        logger.log("WiFi Sta Failed");
         display.println("WiFi Sta Failed");
         display.display();
         delay(2000);
         WiFi.mode(WIFI_MODE_AP);
         WiFi.softAP(hostname, macAddr);
         display.clearDisplay();
-        log("WiFi AP Mode: " + hostname + "," + macAddr + "," + WiFi.softAPIP().toString());
+        logger.log("WiFi AP Mode: " + hostname + "," + macAddr + "," + WiFi.softAPIP().toString());
     }
 
     // MQTT broker setup
     // Subscribe to a topic pattern and attach a callback
     MQTT_TOPIC = String("device/") + macAddr;
-    log("Subscribing to topic: " + MQTT_TOPIC);
+    logger.log("Subscribing to topic: " + MQTT_TOPIC);
     mqtt.subscribe(MQTT_TOPIC.c_str(), [](const char *topic, const char *payload) {
-        log(String("Received message in topic '") + String(topic) + ": " + String(payload));
+        logger.log(String("Received message in topic '") + String(topic) + ": " + String(payload));
         JsonDocument doc;
         deserializeJson(doc, payload);
         if (doc.containsKey("wifi")) {
@@ -593,7 +608,7 @@ void setup() {
             }
             String wifi_config_json;
             serializeJson(wifi_config, wifi_config_json);
-            log("Saving wifi config: " + wifi_config_json);
+            logger.log("Saving wifi config: " + wifi_config_json);
         }
         if (doc.containsKey("power")) {
             if (doc["power"].containsKey("voltage")) {
@@ -617,7 +632,16 @@ void setup() {
         config_update = true;
     });
     mqtt.begin();
-    displayStatus();
+    logger.setMqtt(&mqtt, MQTT_TOPIC);
+    // displayStatus();
+
+    PageSysStatus *statusPage = new PageSysStatus(&WiFi, &MQTT_TOPIC);
+    menu.addPage(statusPage);
+    logger.log(String(menu.getPagesCount()));
+    PageLogger *loggerPage = new PageLogger(&logger);
+    menu.addPage(loggerPage);
+    logger.log(String(menu.getPagesCount()));
+    menu.draw(&display);
 
     // Interrupt sensor switch
     pinMode(PIN_SENSOR, INPUT_PULLUP);
@@ -645,7 +669,7 @@ void setup() {
             break;
         }
         mx30102_available = particleSensor.begin();
-        log("MAX30105 is not loaded, retrying.");
+        logger.log("MAX30105 is not loaded, retrying.");
         delay(100);
     }
     if (mx30102_available) {
@@ -657,11 +681,11 @@ void setup() {
         int pulseWidth = prefs.getInt("pulse_width", 215);   // Options: 69, 118, 215, 411
         int adcRange = prefs.getInt("adc_range", 4096);      // Options: 2048, 4096, 8192, 16384
         particleSensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange);
-        log("Red,IR=" + String(particleSensor.getRed()) + "," + particleSensor.getIR());
-        log("MAX30105 is set");
+        logger.log("Red,IR=" + String(particleSensor.getRed()) + "," + particleSensor.getIR());
+        logger.log("MAX30105 is set");
         digitalWrite(PIN_READ_LED, LOW);
     } else {
-        log("MAX30105 is not loaded, skipping.");
+        logger.log("MAX30105 is not loaded, skipping.");
         mx30102_available = false;
     }
 
@@ -675,24 +699,45 @@ void setup() {
         uint16_t tvoc_base = prefs.getUShort("sgp30_tvoc_base", 0);
         if (eco2_base > 0 && tvoc_base > 0) {
             sgp.setIAQBaseline(eco2_base, tvoc_base);
-            log("Set SGP30 base line: " + String(eco2_base) + "," + String(tvoc_base));
+            logger.log("Set SGP30 base line: " + String(eco2_base) + "," + String(tvoc_base));
         } else {
-            log("SGP30 base line not found");
+            logger.log("SGP30 base line not found");
         }
-        log("SGP30 is loaded");
+        logger.log("SGP30 is loaded");
     } else {
-        log("SGP30 is not loaded, skipping.");
+        logger.log("SGP30 is not loaded, skipping.");
+    }
+
+    // init aht20
+    aht20_available = aht.begin();
+    if (aht20_available) {
+        logger.log("AHT20 is loaded");
+    } else {
+        logger.log("AHT20 is not loaded, skipping.");
+    }
+
+    // init bmp280
+    bmp280_available = bmp.begin();
+    if (bmp280_available) {
+        logger.log("BMP280 is loaded");
+        bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,     /* Operating Mode. */
+                        Adafruit_BMP280::SAMPLING_X2,     /* Temp. oversampling */
+                        Adafruit_BMP280::SAMPLING_X16,    /* Pressure oversampling */
+                        Adafruit_BMP280::FILTER_X16,      /* Filtering. */
+                        Adafruit_BMP280::STANDBY_MS_500); /* Standby time. */
+    } else {
+        logger.log("BMP280 is not loaded, skipping.");
     }
 }
 
 void loop() {
     mqtt.loop();
     if (millis() - ts_last_screen_update > INTERVAL_SCREEN_UPDATE) {
-        if(millis() - ts_last_btn_press > INTERVAL_SCREEN_OFF) {
-            current_screen = SCREEN_OFF;
+        BtnEvent evnet = btn.pop();
+        if (evnet.btn != BTN_NONE) {
+            menu.onBtn(evnet);
         }
-        ts_last_screen_update = millis();
-        updateDisplay();
+        menu.draw(&display);
     }
 
     // Motor update
@@ -717,7 +762,7 @@ void loop() {
         prefs.putLong("motor_interval", motor_interval);
         prefs.putLong("motor_percent", motor_percent);
         prefs.putChar("motor_diroption", motor_diroption);
-        log("Config updated");
+        logger.log("Config updated");
     }
 
     // Publish basic info every 5 seconds
@@ -779,7 +824,7 @@ void loop() {
 
     if (sensor_switch_update && sensor_switch_count % 2 == 0) {
         sensor_switch_update = false;
-        log("stop motor");
+        logger.log("stop motor");
         setMotor(0, current_dir);
         ts_last_stop = millis();
     }
@@ -791,6 +836,10 @@ void loop() {
 
     // If we have enough data, run the algorithm
     if (mx30102_available && readSensor() && irBuffer.isFull()) {
+        ts_last_btn_press = millis();
+        if (current_screen == SCREEN_OFF) {
+            current_screen = SCREEN_CONF;
+        }
         redBuffer.copyToArray(redArray);
         irBuffer.copyToArray(irArray);
 
@@ -818,12 +867,30 @@ void loop() {
     // SGP30
     if (sgp30_available && millis() - ts_last_sgp30_update > INTERVAL_SGP30_UPDATE_MILLIS) {
         ts_last_sgp30_update = millis();
+
+        // test aht and bmp
+        if (aht20_available) {
+            sensors_event_t humidity, temp;
+            if (!aht.getEvent(&humidity, &temp)) {
+                logger.log("AHT20 reading failed");
+            }
+            logger.log("AHT20: " + String(temp.temperature) + "C " + String(humidity.relative_humidity) + "%");
+            sgp.setHumidity(getAbsoluteHumidity(temp.temperature, humidity.relative_humidity));
+        }
+        if (bmp280_available) {
+            logger.log("BMP280: " + String(bmp.readTemperature()) + "C; " + String(bmp.readPressure()) + "Pa; " +
+                       String(bmp.readAltitude()) + "m");
+        }
+
         if (!sgp.IAQmeasure()) {
-            log("SGP30 IAQ measure failed");
+            logger.log("SGP30 IAQ measure failed");
         }
         if (!sgp.IAQmeasureRaw()) {
-            log("SGP30 IAQ measure raw failed");
+            logger.log("SGP30 IAQ measure raw failed");
         }
+        logger.log("SGP30: TVOC " + String(sgp.TVOC) + " ppb, eCO2 " + String(sgp.eCO2) + " ppm, raw H2 " + String(sgp.rawH2) +
+                   " raw Ethanol " + String(sgp.rawEthanol));
+
         // get base line
         if (millis() - ts_last_sgp30_baseline > INTERVAL_SGP30_BASELINE_MILLIS) {
             ts_last_sgp30_baseline = millis();
@@ -841,7 +908,7 @@ void loop() {
             // Save base line
             prefs.putUShort("sgp30_eco2_base", eco2_base);
             prefs.putUShort("sgp30_tvoc_base", tvoc_base);
-            log("Saved SGP30 base line: " + String(eco2_base) + "," + String(tvoc_base));
+            logger.log("Saved SGP30 base line: " + String(eco2_base) + "," + String(tvoc_base));
             String res;
             serializeJson(doc, res);
             mqtt.publish(MQTT_TOPIC, res);
